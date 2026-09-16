@@ -89,3 +89,10 @@ git -C brush apply ../brush-patch/depth-distortion.patch
   per-site altitude numbers aren't valid on the merged two-site scene.
 - A training run takes 5 to 28 hours locally, and the GPU's 4 GiB single-buffer
   limit caps a scene at about 23.7 M splats.
+
+## License
+
+MIT, see `LICENSE`. Two parts come from other projects and keep their own licenses:
+`viewer/` is a fork of antimatter15/splat (MIT, Copyright (c) 2023 Kevin Kwok, see
+`viewer/LICENSE`), and `brush-patch/` modifies Brush, so it's under Brush's
+Apache-2.0 license.
