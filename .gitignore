@@ -1,0 +1,40 @@
+# This folder holds ~65 GB of footage, frames, COLMAP databases and training
+# outputs. None of that belongs in git, so everything is ignored by default and
+# only code and write-ups are let back in. To track a new top-level file or
+# folder, add a "!" line for it below.
+/*
+
+!/.gitignore
+!/README.md
+!/NOTES.md
+!/PORTFOLIO.md
+!/PLAN_depth_distortion.md
+!/requirements.txt
+
+!/scripts/
+/scripts/__pycache__/
+
+# Viewer: my code only. The .splat scenes, camera/trajectory JSON and the
+# footage in viewer/video are data, and main.js.orig/.preghost are backups.
+!/viewer/
+/viewer/*
+!/viewer/index.html
+!/viewer/verify.html
+!/viewer/main.js
+!/viewer/ghosts.js
+!/viewer/convert.py
+!/viewer/LICENSE
+!/viewer/README.md
+
+# Changes to Brush, kept as a patch because brush/ is its own upstream clone.
+!/brush-patch/
+
+# Small metric summaries only. Images, logs and the survey/xdense dumps stay out.
+!/reports/
+/reports/*
+!/reports/*.json
+!/reports/*.txt
+
+.DS_Store
+*.pyc
+# PUBLISH.md is left out on purpose: it describes the home NAS setup.

@@ -1,0 +1,12 @@
+aug x aug2   55x55 probes
+
+pairs >=80 inliers            : 41
+  of those, on GROUND (y>=0.45): 22
+aug probes with a ground link : 11/55 (20%)
+aug2 probes with a ground link : 8/55 (15%)
+longest contiguous aug stretch : 2 probes
+longest contiguous aug2 stretch : 2 probes
+
+clips involved in ground links:
+  aug: {'0050': 2, '0052': 4, '0055': 5}
+  aug2: {'0057': 4, '0058': 1, '0060': 3}

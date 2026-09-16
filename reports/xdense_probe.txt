@@ -1,0 +1,26 @@
+CONTROL old-vs-old consecutive (60 probes over both clips): median 13  p90 16  max 57
+
+0050: 2400 pairs  max 76  p99 25 >=40 5  >=80 0
+   #1   76 inliers   OLD_s00.jpg  <->  0050_s10.jpg
+   #2   75 inliers   OLD_s53.jpg  <->  0050_s10.jpg
+   #3   72 inliers   OLD_s07.jpg  <->  0050_s10.jpg
+
+0051: 2400 pairs  max 56  p99 30 >=40 9  >=80 0
+   #1   56 inliers   OLD_s33.jpg  <->  0051_s36.jpg
+   #2   52 inliers   OLD_s33.jpg  <->  0051_s34.jpg
+   #3   51 inliers   OLD_s33.jpg  <->  0051_s30.jpg
+
+0052: 2400 pairs  max 64  p99 24 >=40 5  >=80 0
+   #1   64 inliers   OLD_s07.jpg  <->  0052_s15.jpg
+   #2   48 inliers   OLD_s07.jpg  <->  0052_s16.jpg
+   #3   47 inliers   OLD_s35.jpg  <->  0052_s31.jpg
+
+0053: 2400 pairs  max 50  p99 23 >=40 2  >=80 0
+   #1   50 inliers   OLD_s33.jpg  <->  0053_s35.jpg
+   #2   40 inliers   OLD_s07.jpg  <->  0053_s35.jpg
+   #3   36 inliers   OLD_s26.jpg  <->  0053_s02.jpg
+
+0055: 2400 pairs  max 70  p99 22 >=40 5  >=80 0
+   #1   70 inliers   OLD_s00.jpg  <->  0055_s28.jpg
+   #2   53 inliers   OLD_s00.jpg  <->  0055_s25.jpg
+   #3   52 inliers   OLD_s53.jpg  <->  0055_s25.jpg

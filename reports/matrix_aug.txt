@@ -1,0 +1,48 @@
+within-clip control (consecutive samples):
+   0050: median   13  max 2439  (low median = fast flight, little self-overlap)
+   0051: median   97  max  454  (low median = fast flight, little self-overlap)
+   0052: median   12  max   78  (low median = fast flight, little self-overlap)
+   0053: median   26  max  223  (low median = fast flight, little self-overlap)
+   0055: median   13  max   27  (low median = fast flight, little self-overlap)
+   0057: median   12  max   43  (low median = fast flight, little self-overlap)
+   0058: median   14  max   17  (low median = fast flight, little self-overlap)
+   0059: median  168  max  215  (low median = fast flight, little self-overlap)
+   0060: median   12  max   38  (low median = fast flight, little self-overlap)
+
+pair             max   p90  >=40  >=80  verdict
+0050-0051        138    29    21    11  strong
+0050-0052        193    25    18     9  strong
+0050-0053        206    24    20     2  usable
+0050-0055        209    27    20     8  strong
+0050-0057        196    17     7     2  usable
+0050-0058         84    15     4     1  usable
+0050-0059         91    24     8     1  usable
+0050-0060         94    15     6     3  usable
+0051-0052         85    25    21     4  strong
+0051-0053        142    25    23    13  strong
+0051-0055         59    19     6     0  usable
+0051-0057        124    14     9     2  usable
+0051-0058        128    14     7     5  strong
+0051-0059        144    14     9     6  strong
+0051-0060        108    14     6     4  strong
+0052-0053        173    17    10     2  usable
+0052-0055        413    27    24    13  strong
+0052-0057        174    16     7     4  strong
+0052-0058        116    15     3     2  weak
+0052-0059        145    15     3     3  weak
+0052-0060        151    16     5     2  usable
+0053-0055        108    23    18     4  strong
+0053-0057        119    16     5     3  usable
+0053-0058        114    15     2     1  weak
+0053-0059        199    18    14     5  strong
+0053-0060        114    15     3     1  weak
+0055-0057        159    22    10     4  strong
+0055-0058         94    17     5     1  usable
+0055-0059         92    24    16     2  usable
+0055-0060        236    18     9     4  strong
+0057-0058         94    18     8     1  usable
+0057-0059        124    22    13     3  usable
+0057-0060        231    18     8     1  usable
+0058-0059        130    20     4     3  usable
+0058-0060        128    18     6     2  usable
+0059-0060        337    29    18     6  strong

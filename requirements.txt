@@ -1,0 +1,8 @@
+# Python 3.14, versions as used. COLMAP 4.1.1, ffmpeg and Gyroflow are
+# installed separately (Homebrew / app bundle), and Brush is built from source.
+numpy==2.5.2
+scipy==1.18.1
+opencv-python-headless==5.0.0.93
+matplotlib==3.11.1
+pillow==12.3.0
+cbor2==6.1.4

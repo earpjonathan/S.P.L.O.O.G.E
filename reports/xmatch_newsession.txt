@@ -1,0 +1,13 @@
+CONTROL 0026 vs itself (consecutive samples): median 12  max 34
+
+pair           max   p90   p75   med  >=40  >=80  verdict
+0026-0027      302    17    14    12    15     7  strong overlap   (n=324)
+0026-0050       29    17    14    12     0     0  no usable overlap   (n=324)
+0026-0051       23    16    14    12     0     0  no usable overlap   (n=324)
+0026-0052       43    16    14    12     1     0  weak   (n=324)
+0026-0053       29    15    14    12     0     0  no usable overlap   (n=324)
+0026-0055       41    16    14    12     1     0  weak   (n=324)
+0026-0057       28    15    13    12     0     0  no usable overlap   (n=324)
+0026-0058       31    16    13    12     0     0  no usable overlap   (n=324)
+0026-0059       21    14    13    12     0     0  no usable overlap   (n=324)
+0026-0060       26    15    13    12     0     0  no usable overlap   (n=324)

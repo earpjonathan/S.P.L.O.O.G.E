@@ -1,0 +1,1279 @@
+diff --git a/crates/brush-render/src/bwd/burn_glue.rs b/crates/brush-render/src/bwd/burn_glue.rs
+index b2f632a..f3badab 100644
+--- a/crates/brush-render/src/bwd/burn_glue.rs
++++ b/crates/brush-render/src/bwd/burn_glue.rs
+@@ -61,7 +61,8 @@ pub(crate) struct SplatGrads<B: Backend> {
+ /// called from the `Backward` impl on the inner backend.
+ pub(crate) trait SplatBwdOps: Backend {
+     /// Backward pass for rasterization.
+-    /// Returns sparse `v_combined` [`num_visible`, 10] indexed by `compact_gid`.
++    /// Returns sparse `v_combined` [`num_visible`, 11] indexed by `compact_gid`.
++    /// Lane 10 is the view-depth gradient, nonzero only under `distortion`.
+     #[allow(clippy::too_many_arguments)]
+     fn rasterize_bwd(
+         out_img: FloatTensor<Self>,
+@@ -72,6 +73,7 @@ pub(crate) trait SplatBwdOps: Backend {
+         img_size: glam::UVec2,
+         v_output: FloatTensor<Self>,
+         smooth_cutoff: bool,
++        distortion: bool,
+     ) -> RasterizeGrads<Self>;
+ 
+     /// Backward pass for projection.
+@@ -150,6 +152,7 @@ impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
+             state.img_size,
+             v_output,
+             state.pass.smooth_cutoff(),
++            state.pass.distortion(),
+         );
+ 
+         let splat_grads = B::project_bwd(
+@@ -410,6 +413,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
+         img_size: glam::UVec2,
+         v_output: FloatTensor<Self>,
+         smooth_cutoff: bool,
++        distortion: bool,
+     ) -> RasterizeGrads<Self> {
+         #[derive(Debug)]
+         struct CustomOp {
+@@ -417,6 +421,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
+             background: Vec3,
+             img_size: glam::UVec2,
+             smooth_cutoff: bool,
++            distortion: bool,
+         }
+ 
+         impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
+@@ -445,6 +450,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
+                     self.img_size,
+                     h.get_float_tensor::<MainBackendBase>(v_output),
+                     self.smooth_cutoff,
++                    self.distortion,
+                 );
+ 
+                 h.register_float_tensor::<MainBackendBase>(&v_combined.id, grads.v_combined);
+@@ -468,7 +474,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
+         let outputs = {
+             let v_combined_out = TensorIr::uninit(
+                 client.create_empty_handle(),
+-                Shape::new([num_visible, 10]),
++                Shape::new([num_visible, 11]),
+                 DType::F32,
+             );
+             let stream = StreamId::current();
+@@ -482,6 +488,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
+                 background,
+                 img_size,
+                 smooth_cutoff,
++                distortion,
+             };
+             client
+                 .register(stream, OperationIr::Custom(desc), op)
+diff --git a/crates/brush-render/src/bwd/kernels/project_backwards.rs b/crates/brush-render/src/bwd/kernels/project_backwards.rs
+index 00d3342..af1b87d 100644
+--- a/crates/brush-render/src/bwd/kernels/project_backwards.rs
++++ b/crates/brush-render/src/bwd/kernels/project_backwards.rs
+@@ -124,7 +124,7 @@ pub fn project_backwards_kernel(
+     // splats that contributed to a pixel; non-contributing splats leave
+     // v_rasterize_grads at zero and (since the dense outputs are zero-
+     // init) we can return without writing anything at all.
+-    let rg_base = (compact_gid * 10u32) as usize;
++    let rg_base = (compact_gid * 11u32) as usize;
+     let v_mean2d_x = v_rasterize_grads[rg_base];
+     let v_mean2d_y = v_rasterize_grads[rg_base + 1];
+     let v_conics_x = v_rasterize_grads[rg_base + 2];
+@@ -135,6 +135,9 @@ pub fn project_backwards_kernel(
+     let v_color_b = v_rasterize_grads[rg_base + 7];
+     let v_alpha_in = v_rasterize_grads[rg_base + 8];
+     let v_refine_in = v_rasterize_grads[rg_base + 9];
++    // Lane 10: d(distortion)/d(view depth). Zero-init, so this is a no-op
++    // whenever the distortion pass is off.
++    let v_depth_in = v_rasterize_grads[rg_base + 10];
+ 
+     let any_grad = v_mean2d_x != 0.0f32
+         || v_mean2d_y != 0.0f32
+@@ -145,7 +148,8 @@ pub fn project_backwards_kernel(
+         || v_color_g != 0.0f32
+         || v_color_b != 0.0f32
+         || v_alpha_in != 0.0f32
+-        || v_refine_in != 0.0f32;
++        || v_refine_in != 0.0f32
++        || v_depth_in != 0.0f32;
+     if !any_grad {
+         terminate!();
+     }
+@@ -221,6 +225,11 @@ pub fn project_backwards_kernel(
+     // v_covar_c = J^T * v_cov2d * J (2x2 sym → 3x3 sym).
+     let vcc = cam_jac.transpose_congruence_sym2(v_cov2d);
+ 
++    // The distortion loss sees the mean only through `depth = mean_c.z()`,
++    // so its gradient is a pure +z push in camera space before the rotation
++    // back to world.
++    let v_mean_c = v_mean_c.add(Vec3A::new(0.0f32, 0.0f32, v_depth_in));
++
+     let v_mean = view_rot.transpose_mul_vec3(v_mean_c).add(v_mean_from_sh);
+ 
+     // v_covar = R^T * v_covar_c * R (symmetric).
+diff --git a/crates/brush-render/src/bwd/kernels/rasterize_backwards.rs b/crates/brush-render/src/bwd/kernels/rasterize_backwards.rs
+index 105a83a..a34695f 100644
+--- a/crates/brush-render/src/bwd/kernels/rasterize_backwards.rs
++++ b/crates/brush-render/src/bwd/kernels/rasterize_backwards.rs
+@@ -39,6 +39,8 @@ pub struct SplatGrad {
+     pub rgb_b: f32,
+     pub alpha: f32,
+     pub refine: f32,
++    /// d(distortion)/d(view depth). Zero unless the distortion pass is on.
++    pub depth: f32,
+ }
+ 
+ #[cube]
+@@ -54,6 +56,7 @@ fn zero_grad() -> SplatGrad {
+         rgb_b: 0.0f32,
+         alpha: 0.0f32,
+         refine: 0.0f32,
++        depth: 0.0f32,
+     }
+ }
+ 
+@@ -107,6 +110,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
+     v_splats: &mut Tensor<Atomic<A::Storage>>,
+     u: RasterizeUniforms,
+     #[comptime] smooth_cutoff: bool,
++    #[comptime] distortion: bool,
+ ) {
+     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
+     // Only `pix_state` lives in shared memory — it gets read-modify-
+@@ -115,8 +119,19 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
+     // pre-roll) are read-only post-init and L1-cached, so we re-derive
+     // them inline in the inner loop. Smaller shared footprint → more
+     // workgroup occupancy on Apple.
+-    let mut pix_state = Shared::new_slice((TILE_SIZE * 4u32) as usize);
+-    load_pixel_state(output, u, tile_origin_x, tile_origin_y, &mut pix_state);
++    // Under distortion the state widens to 7 (running A, B, R alongside the
++    // remaining colour and T). 7 KiB of shared vs 4 KiB — comptime so the
++    // default training path keeps its occupancy.
++    let state_stride = comptime![if distortion { 7u32 } else { 4u32 }];
++    let mut pix_state = Shared::new_slice((TILE_SIZE * state_stride) as usize);
++    load_pixel_state(
++        output,
++        u,
++        tile_origin_x,
++        tile_origin_y,
++        &mut pix_state,
++        distortion,
++    );
+     let (range_lo, range_hi) = load_range(tile_offsets, tile_id);
+     let num_splats_in_tile = range_hi - range_lo;
+     let rounds = (num_splats_in_tile + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
+@@ -142,9 +157,10 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
+             v_output,
+             u,
+             smooth_cutoff,
++            distortion,
+         );
+         if splat_active {
+-            let base = (compact_gid * 10u32) as usize;
++            let base = (compact_gid * 11u32) as usize;
+             A::add(&v_splats[base], grad.xy_x);
+             A::add(&v_splats[base + 1], grad.xy_y);
+             A::add(&v_splats[base + 2], grad.conic_x);
+@@ -155,6 +171,9 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
+             A::add(&v_splats[base + 7], grad.rgb_b);
+             A::add(&v_splats[base + 8], grad.alpha);
+             A::add(&v_splats[base + 9], grad.refine);
++            if comptime![distortion] {
++                A::add(&v_splats[base + 10], grad.depth);
++            }
+         }
+         batch_idx += 1u32;
+     }
+@@ -194,7 +213,11 @@ fn load_pixel_state(
+     tile_origin_x: u32,
+     tile_origin_y: u32,
+     pix_state: &mut Shared<[f32]>,
++    #[comptime] distortion: bool,
+ ) {
++    // `pix_state` and `out_img` happen to share this stride: both are 7 under
++    // distortion and 4 otherwise.
++    let stride = comptime![if distortion { 7u32 } else { 4u32 }];
+     let pixels_per_load = (TILE_SIZE + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
+     let mut p = 0u32;
+     while p < pixels_per_load {
+@@ -203,10 +226,10 @@ fn load_pixel_state(
+             let pix_x = tile_origin_x + pix_rank % TILE_WIDTH;
+             let pix_y = tile_origin_y + pix_rank / TILE_WIDTH;
+             let inside = pix_x < u.img_w && pix_y < u.img_h;
+-            let s = (pix_rank * 4u32) as usize;
++            let s = (pix_rank * stride) as usize;
+             if inside {
+                 let pix_id = pix_x + pix_y * u.img_w;
+-                let base = (pix_id * 4u32) as usize;
++                let base = (pix_id * stride) as usize;
+                 let final_r = output[base];
+                 let final_g = output[base + 1];
+                 let final_b = output[base + 2];
+@@ -216,11 +239,24 @@ fn load_pixel_state(
+                 pix_state[s + 1] = final_g - t_final * u.bg_g;
+                 pix_state[s + 2] = final_b - t_final * u.bg_b;
+                 pix_state[s + 3] = 1.0f32;
++                if comptime![distortion] {
++                    // A_0 = B_0 = 0. R_0 = sum_i w_i g_i = 2L by Euler's
++                    // theorem (L is homogeneous of degree 2 in w), and L is
++                    // exactly what the forward left in channel 4.
++                    pix_state[s + 4] = 0.0f32;
++                    pix_state[s + 5] = 0.0f32;
++                    pix_state[s + 6] = 2.0f32 * output[base + 4];
++                }
+             } else {
+                 pix_state[s] = 0.0f32;
+                 pix_state[s + 1] = 0.0f32;
+                 pix_state[s + 2] = 0.0f32;
+                 pix_state[s + 3] = 0.0f32;
++                if comptime![distortion] {
++                    pix_state[s + 4] = 0.0f32;
++                    pix_state[s + 5] = 0.0f32;
++                    pix_state[s + 6] = 0.0f32;
++                }
+             }
+         }
+         p += 1u32;
+@@ -261,7 +297,9 @@ fn accumulate_grads_for_batch(
+     v_output: &Tensor<f32>,
+     u: RasterizeUniforms,
+     #[comptime] smooth_cutoff: bool,
++    #[comptime] distortion: bool,
+ ) -> SplatGrad {
++    let stride = comptime![if distortion { 7u32 } else { 4u32 }];
+     let conic = Sym2 {
+         c00: splat.conic_x,
+         c01: splat.conic_y,
+@@ -282,7 +320,7 @@ fn accumulate_grads_for_batch(
+ 
+         if active_iter {
+             let pixel_rank = i - UNIT_POS;
+-            let s = (pixel_rank * 4u32) as usize;
++            let s = (pixel_rank * stride) as usize;
+             let state_x = pix_state[s];
+             let state_y = pix_state[s + 1];
+             let state_z = pix_state[s + 2];
+@@ -320,7 +358,7 @@ fn accumulate_grads_for_batch(
+                         // loads for ~5 KiB of shared memory back, which
+                         // recovers an Apple-GPU occupancy slot.
+                         let pix_id = pix_x + pix_y * u.img_w;
+-                        let pix_base = (pix_id * 4u32) as usize;
++                        let pix_base = (pix_id * stride) as usize;
+                         let v_o_x = v_output[pix_base];
+                         let v_o_y = v_output[pix_base + 1];
+                         let v_o_z = v_output[pix_base + 2];
+@@ -346,7 +384,33 @@ fn accumulate_grads_for_batch(
+                         let new_remain_z = state_z - vis * clamped_b;
+                         // Chain through the cutoff. Hard step (production):
+                         // w' = 0 and w == 1 in-branch, so the factor is 1.
+-                        let v_alpha_eff = dot_rgb + v_o_w * ra;
++                        let mut v_alpha_eff = dot_rgb + v_o_w * ra;
++                        if comptime![distortion] {
++                            // Replaying forward order, so pix_state holds the
++                            // prefix sums exactly as the forward built them.
++                            let t_k = splat.depth;
++                            let w_k = vis;
++                            let a_k = pix_state[s + 4];
++                            let b_k = pix_state[s + 5];
++                            let r_k = pix_state[s + 6];
++                            let v_dist = v_output[pix_base + 4];
++                            let a_total = output[pix_base + 5];
++                            let b_total = output[pix_base + 6];
++                            // Suffix sums from the totals — no second pass.
++                            let sa_k = a_total - a_k - w_k;
++                            let sb_k = b_total - b_k - w_k * t_k;
++                            let g_k = (t_k * a_k - b_k) + (sb_k - t_k * sa_k);
++                            // R_{k+1} = sum_{i>k} w_i g_i, walked down from 2L
++                            // the same way the remaining-colour state is.
++                            let r_next = r_k - w_k * g_k;
++                            // alpha_k reaches L twice: directly through w_k,
++                            // and through every T_i>k carrying (1 - alpha_k).
++                            v_alpha_eff += v_dist * (g_k * state_w - r_next * ra);
++                            grad.depth += v_dist * w_k * (a_k - sa_k);
++                            pix_state[s + 4] = a_k + w_k;
++                            pix_state[s + 5] = b_k + w_k * t_k;
++                            pix_state[s + 6] = r_next;
++                        }
+                         let dw_dalpha = if comptime![smooth_cutoff] {
+                             alpha_cutoff_weight_deriv(alpha)
+                         } else {
+diff --git a/crates/brush-render/src/bwd/render_bwd.rs b/crates/brush-render/src/bwd/render_bwd.rs
+index b2302d5..959452a 100644
+--- a/crates/brush-render/src/bwd/render_bwd.rs
++++ b/crates/brush-render/src/bwd/render_bwd.rs
+@@ -28,6 +28,7 @@ impl SplatBwdOps for MainBackendBase {
+         img_size: glam::UVec2,
+         v_output: FloatTensor<Self>,
+         smooth_cutoff: bool,
++        distortion: bool,
+     ) -> RasterizeGrads<Self> {
+         let _span = tracing::trace_span!("rasterize_bwd").entered();
+ 
+@@ -36,8 +37,10 @@ impl SplatBwdOps for MainBackendBase {
+         let num_visible = projected_splats.shape()[0].max(1);
+         let client = projected_splats.client.clone();
+ 
+-        // Sparse [num_visible, 10] indexed by compact_gid.
+-        let v_combined = Self::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
++        // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 (view-depth
++        // gradient) is written only under `distortion`; zero-init makes the
++        // unconditional read in project_backwards a no-op otherwise.
++        let v_combined = Self::float_zeros([num_visible, 11].into(), &device, FloatDType::F32);
+ 
+         let tile_bounds = uvec2(
+             img_size.x.div_ceil(crate::shaders::helpers::TILE_WIDTH),
+@@ -77,6 +80,7 @@ impl SplatBwdOps for MainBackendBase {
+                     v_combined.clone().into_tensor_arg(),
+                     uniforms,
+                     smooth_cutoff,
++                    distortion,
+                 );
+             } else {
+                 rasterize_backwards_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
+@@ -91,6 +95,7 @@ impl SplatBwdOps for MainBackendBase {
+                     v_combined.clone().into_tensor_arg(),
+                     uniforms,
+                     smooth_cutoff,
++                    distortion,
+                 );
+             }
+         });
+diff --git a/crates/brush-render/src/gaussian_splats.rs b/crates/brush-render/src/gaussian_splats.rs
+index 9c41e86..17c6592 100644
+--- a/crates/brush-render/src/gaussian_splats.rs
++++ b/crates/brush-render/src/gaussian_splats.rs
+@@ -36,6 +36,14 @@ pub enum RasterPass {
+     /// makes the analytical backward agree with finite-diff at the cutoff,
+     /// at the cost of a sub-1/255 forward shift on edge pixels.
+     BackwardSmoothCutoff,
++    /// Backward + the 2DGS depth-distortion channels. `out_img` grows to 7
++    /// channels: 4 = per-pixel distortion sum, 5 = `A_total`, 6 = `B_total`.
++    /// Additive variant rather than a flag on the others so no existing call
++    /// site changes behaviour.
++    BackwardDistortion,
++    /// `BackwardDistortion` + the C^1 smoothstep cutoff. Test-only: the two
++    /// concerns are orthogonal, and finite-diff needs both at once.
++    BackwardDistortionSmoothCutoff,
+ }
+ 
+ impl RasterPass {
+@@ -43,7 +51,18 @@ impl RasterPass {
+         !matches!(self, Self::Forward)
+     }
+     pub const fn smooth_cutoff(self) -> bool {
+-        matches!(self, Self::BackwardSmoothCutoff)
++        matches!(
++            self,
++            Self::BackwardSmoothCutoff | Self::BackwardDistortionSmoothCutoff
++        )
++    }
++    /// Whether `out_img` carries the depth-distortion channels (making it 7
++    /// channels instead of 4). Implies `bwd_info`.
++    pub const fn distortion(self) -> bool {
++        matches!(
++            self,
++            Self::BackwardDistortion | Self::BackwardDistortionSmoothCutoff
++        )
+     }
+ }
+ 
+diff --git a/crates/brush-render/src/kernels/helpers.rs b/crates/brush-render/src/kernels/helpers.rs
+index da35eb1..7025082 100644
+--- a/crates/brush-render/src/kernels/helpers.rs
++++ b/crates/brush-render/src/kernels/helpers.rs
+@@ -49,7 +49,7 @@ pub fn alpha_cutoff_weight_deriv(alpha: f32) -> f32 {
+ /// `f32` lanes per projected splat. Layout matches `Splat`:
+ ///   0:xy_x, 1:xy_y, 2:conic_x, 3:conic_y, 4:conic_z, 5:color_a,
+ ///   6:color_r, 7:color_g, 8:color_b.
+-pub const PROJECTED_LANES: u32 = 9;
++pub const PROJECTED_LANES: u32 = 10;
+ pub const PROJECTED_LANES_USIZE: usize = PROJECTED_LANES as usize;
+ 
+ #[cube]
+@@ -295,6 +295,7 @@ pub fn read_projected_splat(projected: &Tensor<f32>, idx: u32) -> Splat {
+         color_r: projected[b + 6],
+         color_g: projected[b + 7],
+         color_b: projected[b + 8],
++        depth: projected[b + 9],
+     }
+ }
+ 
+@@ -310,6 +311,7 @@ pub fn write_projected_splat(projected: &mut Tensor<f32>, idx: u32, splat: Splat
+     projected[b + 6] = splat.color_r;
+     projected[b + 7] = splat.color_g;
+     projected[b + 8] = splat.color_b;
++    projected[b + 9] = splat.depth;
+ }
+ 
+ /// View-space transform of a world-space mean using the project uniforms'
+diff --git a/crates/brush-render/src/kernels/project_visible.rs b/crates/brush-render/src/kernels/project_visible.rs
+index 20fcddf..2cc246c 100644
+--- a/crates/brush-render/src/kernels/project_visible.rs
++++ b/crates/brush-render/src/kernels/project_visible.rs
+@@ -83,6 +83,7 @@ pub fn project_visible_kernel(
+             color_r: cr_c,
+             color_g: cg_c,
+             color_b: cb_c,
++            depth: mean_c.z(),
+         },
+     );
+ }
+diff --git a/crates/brush-render/src/kernels/rasterize.rs b/crates/brush-render/src/kernels/rasterize.rs
+index c3b9095..64d4f7a 100644
+--- a/crates/brush-render/src/kernels/rasterize.rs
++++ b/crates/brush-render/src/kernels/rasterize.rs
+@@ -36,6 +36,12 @@ pub fn rasterize_kernel(
+     tile_bw_div: FastDivmod<u32>,
+     #[comptime] bwd_info: bool,
+     #[comptime] smooth_cutoff: bool,
++    // Accumulate the 2DGS depth-distortion term into channel 4 of
++    // `out_img_f32`, plus the per-pixel weight totals in channels 5 and 6 that
++    // the backward needs to form suffix sums. Requires `bwd_info` (the packed
++    // u8x4 inference path has nowhere to put it, and does not want it). Doc
++    // comments are not legal on fn params, hence `//`.
++    #[comptime] distortion: bool,
+ ) {
+     let global_id = ABSOLUTE_POS as u32;
+     let (pix_x, pix_y) = map_1d_to_2d(global_id, tile_bw_div);
+@@ -77,6 +83,12 @@ pub fn rasterize_kernel(
+     let mut pix_r = 0.0f32;
+     let mut pix_g = 0.0f32;
+     let mut pix_b = 0.0f32;
++    // Depth-distortion running state.  L = sum_i w_i (t_i * A_i - B_i) with
++    // A_i = sum_{j<i} w_j and B_i = sum_{j<i} w_j t_j, which is the O(N) form
++    // of sum_{i,j} w_i w_j |t_i - t_j| when t is traversed front-to-back.
++    let mut dist_acc = 0.0f32;
++    let mut a_acc = 0.0f32;
++    let mut b_acc = 0.0f32;
+     let mut done = !inside;
+     let mut last_useful_isect = range_lo;
+ 
+@@ -147,6 +159,15 @@ pub fn rasterize_kernel(
+                     pix_r += max(local_batch[dst_base + 6], 0.0f32) * vis;
+                     pix_g += max(local_batch[dst_base + 7], 0.0f32) * vis;
+                     pix_b += max(local_batch[dst_base + 8], 0.0f32) * vis;
++                    if comptime![distortion] {
++                        // Pair this splat against the ones ALREADY behind it in
++                        // the front-to-back walk, then fold it into the prefix
++                        // sums. Order matters: A/B must still hold sum_{j<i}.
++                        let t_i = local_batch[dst_base + 9];
++                        dist_acc += vis * (t_i * a_acc - b_acc);
++                        a_acc += vis;
++                        b_acc += vis * t_i;
++                    }
+                     t_acc = next_t;
+                     last_useful_isect = batch_start + t + 1u32;
+                 }
+@@ -165,11 +186,26 @@ pub fn rasterize_kernel(
+         let final_b = pix_b + t_acc * u.bg_b;
+         let final_a = 1.0f32 - t_acc;
+         if comptime![bwd_info] {
+-            let base = (pix_id * 4u32) as usize;
++            let stride = comptime![if distortion { 7u32 } else { 4u32 }];
++            let base = (pix_id * stride) as usize;
+             out_img_f32[base] = final_r;
+             out_img_f32[base + 1] = final_g;
+             out_img_f32[base + 2] = final_b;
+             out_img_f32[base + 3] = final_a;
++            if comptime![distortion] {
++                out_img_f32[base + 4] = dist_acc;
++                // Saved forward state for the backward, not loss terms: no
++                // gradient flows back through these. The backward replays in
++                // FORWARD order (diagonal scheduling), so it rebuilds the
++                // prefix sums A_k, B_k for free but has no way to see past
++                // splat k. With the totals it does not need to:
++                //   SA_k = A_total - A_k - w_k
++                //   SB_k = B_total - B_k - w_k t_k
++                // which is what removes the second pass the naive derivation
++                // would need for the suffix sums.
++                out_img_f32[base + 5] = a_acc;
++                out_img_f32[base + 6] = b_acc;
++            }
+         } else {
+             let r = clamp(final_r * 255.0f32, 0.0f32, 255.0f32) as u32;
+             let g = clamp(final_g * 255.0f32, 0.0f32, 255.0f32) as u32;
+diff --git a/crates/brush-render/src/kernels/types.rs b/crates/brush-render/src/kernels/types.rs
+index 3f9f517..745b885 100644
+--- a/crates/brush-render/src/kernels/types.rs
++++ b/crates/brush-render/src/kernels/types.rs
+@@ -26,6 +26,11 @@ pub struct Splat {
+     pub color_r: f32,
+     pub color_g: f32,
+     pub color_b: f32,
++    /// View-space depth of the splat centre. Carried through the tile payload
++    /// (rather than read from the `depths` tensor used for the radix sort) so
++    /// the rasteriser's inner loop keeps a purely sequential shared-memory
++    /// access pattern. Needed by the depth-distortion loss.
++    pub depth: f32,
+ }
+ 
+ #[cube]
+@@ -41,6 +46,7 @@ impl Splat {
+             color_r: 0.0f32,
+             color_g: 0.0f32,
+             color_b: 0.0f32,
++            depth: 0.0f32,
+         }
+     }
+ }
+diff --git a/crates/brush-render/src/render.rs b/crates/brush-render/src/render.rs
+index 400acca..178ef44 100644
+--- a/crates/brush-render/src/render.rs
++++ b/crates/brush-render/src/render.rs
+@@ -53,6 +53,7 @@ impl SplatOps for MainBackendBase {
+         );
+         let bwd_info = pass.bwd_info();
+         let smooth_cutoff = pass.smooth_cutoff();
++        let distortion = pass.distortion();
+ 
+         let transforms = into_contiguous(transforms);
+         let sh_coeffs = into_contiguous(sh_coeffs);
+@@ -245,7 +246,14 @@ impl SplatOps for MainBackendBase {
+                 tile_offsets.clone().into_tensor_arg(),
+             );
+         });
+-        let out_dim = if bwd_info { 4 } else { 1 };
++        let out_dim = if distortion {
++            // rgba + distortion + A_total + B_total
++            7
++        } else if bwd_info {
++            4
++        } else {
++            1
++        };
+         let out_img = create_tensor(
+             [img_size.y as usize, img_size.x as usize, out_dim],
+             &device,
+@@ -294,6 +302,7 @@ impl SplatOps for MainBackendBase {
+                 project_uniforms.tile_bounds[0],
+                 bwd_info,
+                 smooth_cutoff,
++                distortion,
+             );
+         });
+         RenderOutput {
+diff --git a/crates/brush-train/src/config.rs b/crates/brush-train/src/config.rs
+index 83fefb3..ae60533 100644
+--- a/crates/brush-train/src/config.rs
++++ b/crates/brush-train/src/config.rs
+@@ -85,6 +85,54 @@ pub struct TrainConfig {
+     #[arg(long, help_heading = "Training options", default_value = "0.004")]
+     pub opac_decay: f32,
+ 
++    /// Strength of the flatness prior applied at each refine step.
++    ///
++    /// 3DGS has no surface prior: from grazing views a thick semi-transparent
++    /// slab and a thin opaque surface produce the same image, so nothing makes
++    /// the optimiser concentrate a surface. On FPV terrain that leaves ~48% of
++    /// the ground's opacity mass BELOW the visible surface and the ground reads
++    /// as see-through when flown close.
++    ///
++    /// Each refine step shrinks every scale axis by `strength * (1 - s/s_max)`
++    /// in log space, so the LARGEST axis is never touched and the splat is
++    /// pushed toward a disc. Annealed to zero over training like `opac_decay`.
++    /// 0 disables (the default, so existing runs are bit-identical).
++    #[arg(long, help_heading = "Refine options", default_value = "0.0")]
++    pub flatten_strength: f32,
++
++    /// Weight on the 2DGS depth-distortion loss.
++    ///
++    /// Penalises `sum_{i,j} w_i w_j |t_i - t_j|` per pixel — the spread of a
++    /// ray's contribution along its own depth. Unlike `flatten_strength`,
++    /// which shapes individual splats, this shapes their ARRANGEMENT along
++    /// the ray, which is the quantity that is actually wrong in a volumetric
++    /// ground slab. Enabling it switches the raster pass to
++    /// `BackwardDistortion`, widening `out_img` to 7 channels. 0 disables
++    /// (the default, so existing runs are bit-identical).
++    #[arg(long, help_heading = "Training options", default_value = "0.0")]
++    pub distortion_weight: f32,
++
++    /// Iteration at which the depth-distortion loss switches on.
++    ///
++    /// 2DGS enables it only after a warmup, and the reason matters: before the
++    /// geometry has any structure, "concentrate each ray's weight at one
++    /// depth" is regularising noise, and it can lock in bad arrangement. Only
++    /// meaningful when `distortion_weight > 0`.
++    #[arg(long, help_heading = "Training options", default_value = "0")]
++    pub distortion_start_iter: u32,
++
++    /// Normalise the depth-distortion loss by each ray's own mean depth.
++    ///
++    /// `L_d` is degree-1 in `t` and unbounded, so a ray through DISTANT
++    /// geometry has a larger absolute depth spread and dominates the
++    /// gradient. Unnormalised at weight 0.05 this collapsed the scene's depth
++    /// range (radius p99 17.45 -> 7.78) and emptied the near field. Dividing
++    /// each pixel's loss by its mean ray depth is exactly equivalent to
++    /// normalising `t`, and makes the term scale-free so near and far rays
++    /// contribute comparably. This is what 2DGS does.
++    #[arg(long, help_heading = "Training options")]
++    pub distortion_normalize: bool,
++
+     /// Weight of l1 loss on alpha if input view has transparency.
+     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
+     pub match_alpha_weight: f32,
+@@ -92,6 +140,17 @@ pub struct TrainConfig {
+     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
+     pub lpips_loss_weight: f32,
+ 
++    /// Side length of the random square crop LPIPS is evaluated on.
++    /// 0 evaluates the whole frame.
++    ///
++    /// Full-frame LPIPS is not usable here: VGG16 forward+backward over a
++    /// 1920x1440 image measured ~29 s/iter on this machine, roughly 50x the
++    /// entire rest of the step, which would turn a 20k run into months. A crop
++    /// bounds that cost, and since a fresh window is drawn every step it still
++    /// covers the whole image over training.
++    #[arg(long, help_heading = "Training options", default_value = "256")]
++    pub lpips_crop: u32,
++
+     /// Base background color (R,G,B) used during training.
+     #[arg(
+         long,
+diff --git a/crates/brush-train/src/train.rs b/crates/brush-train/src/train.rs
+index ed3bb75..221b1db 100644
+--- a/crates/brush-train/src/train.rs
++++ b/crates/brush-train/src/train.rs
+@@ -11,8 +11,8 @@ use crate::{
+ };
+ use brush_dataset::scene::SceneBatch;
+ use brush_loss::{ImageLossConfig, image_loss};
+-use brush_render::bwd::render_splats;
+-use brush_render::gaussian_splats::Splats;
++use brush_render::bwd::render_splats_with_pass;
++use brush_render::gaussian_splats::{RasterPass, Splats};
+ use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
+ use burn::{
+     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
+@@ -207,9 +207,21 @@ impl SplatTrainer {
+             // The splats already carry their 3D-filter floor (set at refine);
+             // the render path folds it in. Optimizer/refine work on raw params.
+             let render_input = splats.clone();
+-            let diff_out = render_splats(render_input, &camera, img_size, background)
+-                .instrument(trace_span!("Forward"))
+-                .await;
++            // The distortion pass costs 3 extra out_img channels and a wider
++            // backward pix_state, so only pay for it when the term is on.
++            // step_count was already incremented for this step, so it is the
++            // current 1-based iteration.
++            let use_distortion = self.config.distortion_weight > 0.0
++                && self.step_count >= self.config.distortion_start_iter;
++            let pass = if use_distortion {
++                RasterPass::BackwardDistortion
++            } else {
++                RasterPass::Backward
++            };
++            let diff_out =
++                render_splats_with_pass(render_input, &camera, img_size, background, pass)
++                    .instrument(trace_span!("Forward"))
++                    .await;
+ 
+             let pred_image = diff_out.img;
+             let refine_weight_holder = diff_out.refine_weight_holder;
+@@ -242,7 +254,9 @@ impl SplatTrainer {
+                 mask: masked_alpha,
+             };
+             let pred_for_loss = if do_alpha_match {
+-                pred_image.clone()
++                // Slice explicitly: under the distortion pass `pred_image` has
++                // 7 channels, and image_loss expects rgba.
++                pred_image.clone().slice(s![.., .., 0..4])
+             } else {
+                 pred_image.clone().slice(s![.., .., 0..3])
+             };
+@@ -261,17 +275,61 @@ impl SplatTrainer {
+ 
+             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
+             // here costs ~99 MB at 4K, only when LPIPS is enabled.
++            //
++            // Evaluated on a random square crop, not the whole frame: measured
++            // full-frame, VGG16 fwd+bwd at 1920x1440 ran ~29 s/iter against
++            // ~0.5 s/iter for everything else. Both tensors take the SAME
++            // window, or the loss compares unrelated pixels and the gradient is
++            // noise that still looks like it is training.
+             #[cfg(not(target_family = "wasm"))]
+             if let Some(lpips) = &self.lpips {
+                 let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+                 let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
++                let [h, w, _] = pred_image.dims();
++                let c = self.config.lpips_crop as usize;
++                let (y0, x0, ch, cw) = if c > 0 && h > c && w > c {
++                    use rand::RngExt as _;
++                    let mut rng = rand::rng();
++                    (rng.random_range(0..h - c), rng.random_range(0..w - c), c, c)
++                } else {
++                    (0, 0, h, w)
++                };
+                 loss = loss
+                     + lpips.lpips(
+-                        pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
+-                        gt_rgb_diff.unsqueeze_dim(0),
++                        pred_image
++                            .clone()
++                            .slice(s![y0..y0 + ch, x0..x0 + cw, 0..3])
++                            .unsqueeze_dim(0),
++                        gt_rgb_diff
++                            .slice(s![y0..y0 + ch, x0..x0 + cw, 0..3])
++                            .unsqueeze_dim(0),
+                     ) * self.config.lpips_loss_weight;
+             }
+ 
++            if use_distortion {
++                // Channel 4 is the per-pixel distortion sum. Channels 5/6 are
++                // saved forward state and get NO gradient path in the backward
++                // kernel, so any loss term that touches them must detach first
++                // or autodiff will build a route the kernel silently ignores.
++                let dist = pred_image.clone().slice(s![.., .., 4..5]);
++                let distortion = if self.config.distortion_normalize {
++                    // L_d is degree-1 in t, so dividing a pixel's loss by a
++                    // detached scale c is EXACTLY normalising that pixel's t by
++                    // c. The scale we want is the ray's own mean depth, and the
++                    // forward already saved both halves of it:
++                    // A_total = sum w_i (ch 5), B_total = sum w_i t_i (ch 6).
++                    let a_tot = pred_image.clone().slice(s![.., .., 5..6]).detach();
++                    let b_tot = pred_image.clone().slice(s![.., .., 6..7]).detach();
++                    // Sky pixels have A ~ 0; they also have dist ~ 0, so the
++                    // clamps just keep the division finite.
++                    let mean_depth = b_tot.div(a_tot.clamp_min(1e-6)).clamp_min(1e-3);
++                    dist.div(mean_depth).mean()
++                } else {
++                    dist.mean()
++                };
++                loss = loss + distortion * self.config.distortion_weight;
++            }
++
+             // Strip the autodiff graph off the loss so consumers can read the
+             // scalar later without keeping the backward pass alive.
+             let loss_inner = loss.clone().inner();
+@@ -816,6 +874,35 @@ impl SplatTrainer {
+             inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
+         });
+ 
++        // Flatness prior. Amplifies whatever anisotropy a splat already has,
++        // by shrinking each axis in proportion to how small it already is
++        // relative to that splat's largest axis:
++        //
++        //     log s_i  ->  log s_i - strength * (1 - s_i / s_max)
++        //
++        // The largest axis has ratio 1 and is therefore never shrunk. That
++        // property is the whole point: post-hoc flattening of a trained scene
++        // REGRESSED (bottom-third opacity 0.634 -> 0.421) because collapsing a
++        // slab shrinks coverage and nothing refills the in-plane gaps. Applied
++        // during training the largest axis is preserved AND densification is
++        // still running, so the optimiser maintains coverage itself.
++        //
++        // A perfectly isotropic splat has every ratio at 1 and is left alone,
++        // so this cannot destroy small round detail -- it only sharpens things
++        // that were already sheet-like.
++        let flatten = self.config.flatten_strength * t_shrink_strength;
++        if flatten > 0.0 {
++            splats.transforms = splats.transforms.map(|t| {
++                let log_scales = t.clone().slice(s![.., 7..10]);
++                let scales = log_scales.clone().exp();
++                let max_scale = scales.clone().max_dim(1).clamp_min(1e-30);
++                let ratio = scales / max_scale; // [N,3], in (0, 1]
++                let inv_ratio: Tensor<2> = 1.0 - ratio;
++                let new_log = log_scales - inv_ratio.mul_scalar(flatten);
++                t.slice_assign(s![.., 7..10], new_log)
++            });
++        }
++
+         self.optim = Some(optim);
+         splats
+     }
+diff --git a/crates/lpips/src/lib.rs b/crates/lpips/src/lib.rs
+index b2acbb4..0309161 100644
+--- a/crates/lpips/src/lib.rs
++++ b/crates/lpips/src/lib.rs
+@@ -7,8 +7,35 @@ use burn::nn::pool::MaxPool2d;
+ use burn::nn::pool::MaxPool2dConfig;
+ use burn::tensor::Device;
+ use burn::tensor::activation::relu;
++use burn::module::{ModuleMapper, Param};
+ use burn::{config::Config, module::Module, tensor::Tensor};
+ 
++/// Lift every weight into an autodiff tensor.
++///
++/// The dispatch backend carries autodiff-ness at RUNTIME, in a `BackendTensor`
++/// enum, rather than in the type. A module loaded from a record therefore holds
++/// plain `Float` variants, and the first op that mixes them with the autodiff
++/// activations coming from the rasteriser makes the dispatch layer call
++/// `.autodiff()` on a `Float` and hit `unreachable!()` in
++/// `burn-dispatch/src/tensor.rs:98`. That is why `--lpips-loss-weight` panics
++/// four seconds into training: the path is simply never exercised, since the
++/// weight defaults to 0.0.
++///
++/// Lifting once at load keeps the weights frozen -- no optimiser is ever given
++/// them -- while letting gradients flow through to the prediction, which is the
++/// only reason to have LPIPS in the loss at all.
++struct LiftToAutodiff;
++
++impl ModuleMapper for LiftToAutodiff {
++    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
++        // require_grad(false): the backbone is frozen, so there is no reason to
++        // compute or store a gradient for ~14M VGG parameters every step.
++        // Gradients still flow THROUGH the convolutions to the prediction,
++        // which is the only thing this loss is for.
++        param.map(|t| Tensor::from_inner(t).set_require_grad(false))
++    }
++}
++
+ /// Residual layer block configuration.
+ #[derive(Config, Debug)]
+ struct VggBlockConfig {
+@@ -154,7 +181,7 @@ pub fn load_vgg_lpips(device: &Device) -> LpipsModel {
+     let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(PACKED_WEIGHTS.to_vec()))
+         .expect("Should decode packed weights")
+         .cast_to_module_dtype();
+-    model.load_record(record)
++    model.load_record(record).map(&mut LiftToAutodiff)
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/brush-bench-test/tests/distortion_forward.rs b/crates/brush-bench-test/tests/distortion_forward.rs
+new file mode 100644
+index 0000000..171a0a2
+--- /dev/null
++++ b/crates/brush-bench-test/tests/distortion_forward.rs
+@@ -0,0 +1,127 @@
++//! Forward-pass checks for the depth-distortion channel.
++//!
++//! These need no gradients, and they catch the accumulation bugs that would
++//! otherwise only show up as "training converges slightly worse".
++//!
++//! The load-bearing one is `a_total_equals_alpha`. Channel 5 accumulates
++//! `sum_i w_i` with `w_i = alpha_i * T_i`, and each step subtracts exactly
++//! that from the running transmittance (`T_next = T * (1 - alpha)`), so the
++//! sum telescopes to `1 - T_final` -- which is what channel 3 already holds.
++//! The two must therefore agree to floating point. If the weights are
++//! accumulated in the wrong place (outside the contribute branch, or after
++//! the transmittance update) this test fails immediately and unambiguously.
++
++use brush_render::bwd::render_splats_with_pass;
++use brush_render::gaussian_splats::RasterPass;
++use brush_render::{
++    camera::Camera,
++    gaussian_splats::{SplatRenderMode, Splats},
++    kernels::camera_model::CameraModel,
++};
++use burn::tensor::{Tensor, s};
++use glam::Vec3;
++
++const PASS: RasterPass = RasterPass::BackwardDistortion;
++
++fn std_cam() -> Camera {
++    Camera::new(
++        glam::vec3(0.0, 0.0, -3.0),
++        glam::Quat::IDENTITY,
++        0.6,
++        0.6,
++        glam::vec2(0.5, 0.5),
++        CameraModel::Pinhole,
++    )
++}
++
++fn scene_splats(device: &burn::tensor::Device, n: usize) -> Splats {
++    // Splats stacked along the view axis so a ray crosses several of them at
++    // different depths -- the case the distortion term exists to penalise.
++    let mut means = vec![];
++    let mut rots = vec![];
++    let mut log_scales = vec![];
++    let mut sh_dc = vec![];
++    let mut raw_opac = vec![];
++    for i in 0..n {
++        let z = -0.4 + 0.8 * (i as f32) / (n.max(2) - 1) as f32;
++        means.extend_from_slice(&[0.0, 0.0, z]);
++        rots.extend_from_slice(&[0.9, 0.1, 0.05, 0.03]);
++        log_scales.extend_from_slice(&[-1.4, -1.5, -1.6]);
++        sh_dc.extend_from_slice(&[0.5, 0.5, 0.5]);
++        raw_opac.push(1.2);
++    }
++    Splats::from_raw(
++        means, rots, log_scales, sh_dc, raw_opac,
++        SplatRenderMode::Default, device,
++    )
++}
++
++async fn render(n: usize) -> (Tensor<3>, glam::UVec2) {
++    // render_splats_with_pass goes through the autodiff node even when we only
++    // want the forward, so the device must be lifted or it panics at
++    // burn_glue.rs:253.
++    let device =
++        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
++    let cam = std_cam();
++    let img_size = glam::uvec2(32, 32);
++    let splats = scene_splats(&device, n);
++    let diff = render_splats_with_pass(splats, &cam, img_size, Vec3::ZERO, PASS).await;
++    (diff.img, img_size)
++}
++
++#[tokio::test]
++async fn out_img_has_seven_channels() {
++    let (img, sz) = render(4).await;
++    assert_eq!(
++        img.dims(),
++        [sz.y as usize, sz.x as usize, 7],
++        "BackwardDistortion must widen out_img to rgba + distortion + A_total + B_total"
++    );
++}
++
++#[tokio::test]
++async fn a_total_equals_alpha() {
++    let (img, _) = render(4).await;
++    let alpha = img.clone().slice(s![.., .., 3..4]);
++    let a_total = img.clone().slice(s![.., .., 5..6]);
++    let err = (alpha - a_total)
++        .abs()
++        .max()
++        .into_scalar_async::<f32>()
++        .await
++        .expect("readback");
++    assert!(
++        err < 1e-5,
++        "sum_i w_i must telescope to 1 - T_final (the alpha channel); max err {err}"
++    );
++}
++
++#[tokio::test]
++async fn distortion_is_non_negative() {
++    // Splats are traversed front-to-back, so every pair term is
++    // w_i * (t_i - t_j) with t_i >= t_j. The sum cannot be negative; a
++    // negative value means the prefix sums were updated before the pair term
++    // was formed.
++    let (img, _) = render(4).await;
++    let d = img.slice(s![.., .., 4..5]);
++    let lo = d.min().into_scalar_async::<f32>().await.expect("readback");
++    assert!(lo >= -1e-6, "distortion must be >= 0, saw {lo}");
++}
++
++#[tokio::test]
++async fn single_splat_has_zero_distortion() {
++    // One splat means no pairs, so the double sum is empty.
++    let (img, _) = render(1).await;
++    let d = img.slice(s![.., .., 4..5]);
++    let hi = d.max().into_scalar_async::<f32>().await.expect("readback");
++    assert!(hi < 1e-6, "a single splat cannot self-pair, saw {hi}");
++}
++
++#[tokio::test]
++async fn stacked_splats_have_positive_distortion() {
++    // Four splats spread along the ray is exactly the slab this loss targets.
++    let (img, _) = render(4).await;
++    let d = img.slice(s![.., .., 4..5]);
++    let hi = d.max().into_scalar_async::<f32>().await.expect("readback");
++    assert!(hi > 1e-5, "depth-spread splats must register distortion, saw {hi}");
++}
+diff --git a/crates/brush-bench-test/tests/distortion_backward.rs b/crates/brush-bench-test/tests/distortion_backward.rs
+new file mode 100644
+index 0000000..e1a8545
+--- /dev/null
++++ b/crates/brush-bench-test/tests/distortion_backward.rs
+@@ -0,0 +1,306 @@
++//! Finite-difference check for the depth-distortion BACKWARD pass.
++//!
++//! The forward is already proven by `distortion_forward.rs`, so any failure
++//! here is unambiguously a backward bug — which is the whole reason that
++//! test was written without gradients.
++//!
++//! Two things make this test valid and are easy to get wrong:
++//!
++//! * The loss slices channel 4 ONLY. Channels 5/6 (`A_total`, `B_total`) are
++//!   saved forward state with no gradient path, so a plain `img.mean()` would
++//!   hand them upstream gradient that the backward deliberately ignores, and
++//!   finite-diff would disagree for a reason that is not a bug.
++//! * The pass is `BackwardDistortionSmoothCutoff`. The hard 1/255 cutoff is a
++//!   step discontinuity; central differences straddle it and produce garbage.
++
++use brush_render::bwd::render_splats_with_pass;
++use brush_render::gaussian_splats::RasterPass;
++use brush_render::{
++    camera::Camera,
++    gaussian_splats::{SplatRenderMode, Splats},
++    kernels::camera_model::CameraModel,
++};
++use burn::tensor::{Gradients, Tensor, s};
++use glam::Vec3;
++
++const PASS: RasterPass = RasterPass::BackwardDistortionSmoothCutoff;
++
++#[derive(Clone)]
++struct Scene {
++    means: Vec<f32>,
++    rots: Vec<f32>,
++    log_scales: Vec<f32>,
++    sh_dc: Vec<f32>,
++    raw_opac: Vec<f32>,
++}
++
++/// Four splats stacked along the view ray — the slab this loss targets.
++/// Small lateral offsets and per-splat opacity break the symmetry, so a
++/// sign error cannot cancel itself across a symmetric arrangement.
++fn base_scene() -> Scene {
++    let n = 4usize;
++    let mut s = Scene {
++        means: vec![],
++        rots: vec![],
++        log_scales: vec![],
++        sh_dc: vec![],
++        raw_opac: vec![],
++    };
++    let offs = [(0.00f32, 0.00f32), (0.05, -0.03), (-0.04, 0.06), (0.02, 0.04)];
++    let opac = [1.30f32, 1.05, 1.45, 1.15];
++    for i in 0..n {
++        let z = -0.4 + 0.8 * (i as f32) / (n - 1) as f32;
++        s.means.extend_from_slice(&[offs[i].0, offs[i].1, z]);
++        s.rots.extend_from_slice(&[0.90, 0.10, 0.05, 0.03]);
++        s.log_scales.extend_from_slice(&[-1.4, -1.5, -1.6]);
++        s.sh_dc.extend_from_slice(&[0.5, 0.5, 0.5]);
++        s.raw_opac.push(opac[i]);
++    }
++    s
++}
++
++fn std_cam() -> Camera {
++    Camera::new(
++        glam::vec3(0.0, 0.0, -3.0),
++        glam::Quat::IDENTITY,
++        0.6,
++        0.6,
++        glam::vec2(0.5, 0.5),
++        CameraModel::Pinhole,
++    )
++}
++
++fn build_splats(scene: &Scene, device: &burn::tensor::Device) -> Splats {
++    Splats::from_raw(
++        scene.means.clone(),
++        scene.rots.clone(),
++        scene.log_scales.clone(),
++        scene.sh_dc.clone(),
++        scene.raw_opac.clone(),
++        SplatRenderMode::Default,
++        device,
++    )
++}
++
++/// Scalar loss = mean of the distortion channel alone.
++fn distortion_loss(img: Tensor<3>) -> Tensor<1> {
++    img.slice(s![.., .., 4..5]).mean()
++}
++
++async fn render_value(
++    scene: &Scene,
++    cam: &Camera,
++    img_size: glam::UVec2,
++    device: &burn::tensor::Device,
++) -> f32 {
++    let splats = build_splats(scene, device);
++    let diff = render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await;
++    distortion_loss(diff.img)
++        .into_scalar_async::<f32>()
++        .await
++        .expect("loss readback")
++}
++
++async fn analytical_grads(
++    scene: &Scene,
++    cam: &Camera,
++    img_size: glam::UVec2,
++    device: &burn::tensor::Device,
++) -> (Splats, Gradients) {
++    let splats = build_splats(scene, device);
++    let diff = {
++        let splats = splats.clone();
++        render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await
++    };
++    let grads = distortion_loss(diff.img).backward();
++    (splats, grads)
++}
++
++#[derive(Clone, Copy)]
++enum Lane {
++    Mean,
++    Rot,
++    LogScale,
++    ShDc,
++    RawOpac,
++}
++
++fn lane_name(lane: Lane) -> &'static str {
++    match lane {
++        Lane::Mean => "means",
++        Lane::Rot => "rots",
++        Lane::LogScale => "log_scales",
++        Lane::ShDc => "sh_dc",
++        Lane::RawOpac => "raw_opac",
++    }
++}
++
++fn perturb(scene: &mut Scene, lane: Lane, splat: usize, comp: usize, delta: f32) {
++    match lane {
++        Lane::Mean => scene.means[splat * 3 + comp] += delta,
++        Lane::Rot => scene.rots[splat * 4 + comp] += delta,
++        Lane::LogScale => scene.log_scales[splat * 3 + comp] += delta,
++        Lane::ShDc => scene.sh_dc[splat * 3 + comp] += delta,
++        Lane::RawOpac => scene.raw_opac[splat] += delta,
++    }
++}
++
++async fn read_first<const D: usize>(t: Tensor<D>) -> f32 {
++    t.into_data_async()
++        .await
++        .expect("readback")
++        .into_vec::<f32>()
++        .expect("vec")[0]
++}
++
++async fn analytical_at(
++    splats: &Splats,
++    grads: &Gradients,
++    lane: Lane,
++    splat: usize,
++    comp: usize,
++) -> f32 {
++    match lane {
++        Lane::Mean => {
++            let g = splats.transforms.grad(grads).expect("transforms grad");
++            read_first(g.slice(s![splat..splat + 1, comp..comp + 1])).await
++        }
++        Lane::Rot => {
++            let g = splats.transforms.grad(grads).expect("transforms grad");
++            let c = 3 + comp;
++            read_first(g.slice(s![splat..splat + 1, c..c + 1])).await
++        }
++        Lane::LogScale => {
++            let g = splats.transforms.grad(grads).expect("transforms grad");
++            let c = 7 + comp;
++            read_first(g.slice(s![splat..splat + 1, c..c + 1])).await
++        }
++        Lane::ShDc => {
++            let g = splats.sh_coeffs.grad(grads).expect("sh grad");
++            read_first(g.slice(s![splat..splat + 1, 0..1, comp..comp + 1])).await
++        }
++        Lane::RawOpac => {
++            let g = splats.raw_opacities.grad(grads).expect("opac grad");
++            read_first(g.slice(s![splat..splat + 1])).await
++        }
++    }
++}
++
++#[tokio::test]
++async fn distortion_finite_difference() {
++    let device =
++        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
++    let cam = std_cam();
++    let img_size = glam::uvec2(32, 32);
++    let scene = base_scene();
++
++    let eps = 1e-3_f32;
++    let rel_tol = 0.02_f32;
++    let abs_tol = 2e-6_f32;
++
++    let (splats, grads) = analytical_grads(&scene, &cam, img_size, &device).await;
++
++    // Mean z is the load-bearing case: it is the ONLY route by which the
++    // depth gradient dL/dt reaches a parameter, so if the new
++    // depth -> mean_c.z -> mean path is wrong, these are the entries that
++    // catch it. The x/y entries exercise the alpha route via the 2D
++    // projection, which is the other half of the chain.
++    let cases: &[(Lane, usize, usize)] = &[
++        (Lane::Mean, 0, 2),
++        (Lane::Mean, 1, 2),
++        (Lane::Mean, 2, 2),
++        (Lane::Mean, 3, 2),
++        (Lane::Mean, 0, 0),
++        (Lane::Mean, 1, 1),
++        (Lane::RawOpac, 0, 0),
++        (Lane::RawOpac, 1, 0),
++        (Lane::RawOpac, 2, 0),
++        (Lane::RawOpac, 3, 0),
++        (Lane::LogScale, 0, 0),
++        (Lane::LogScale, 2, 1),
++        (Lane::Rot, 1, 2),
++    ];
++
++    let mut failures = vec![];
++    for &(lane, splat, comp) in cases {
++        let mut plus = scene.clone();
++        perturb(&mut plus, lane, splat, comp, eps);
++        let mut minus = scene.clone();
++        perturb(&mut minus, lane, splat, comp, -eps);
++
++        let f_plus = render_value(&plus, &cam, img_size, &device).await;
++        let f_minus = render_value(&minus, &cam, img_size, &device).await;
++        let numeric = (f_plus - f_minus) / (2.0 * eps);
++        let analytic = analytical_at(&splats, &grads, lane, splat, comp).await;
++
++        let diff = (numeric - analytic).abs();
++        let scale = numeric.abs().max(analytic.abs());
++        let ok = diff <= abs_tol || diff <= rel_tol * scale;
++        println!(
++            "{:>10}[{}][{}]  numeric {:>12.6e}  analytic {:>12.6e}  {}",
++            lane_name(lane),
++            splat,
++            comp,
++            numeric,
++            analytic,
++            if ok { "ok" } else { "MISMATCH" }
++        );
++        if !ok {
++            failures.push(format!(
++                "{}[{}][{}]: numeric {:e} vs analytic {:e}",
++                lane_name(lane),
++                splat,
++                comp,
++                numeric,
++                analytic
++            ));
++        }
++    }
++    assert!(failures.is_empty(), "gradient mismatches:\n{}", failures.join("\n"));
++}
++
++#[tokio::test]
++async fn distortion_gradient_is_nonzero() {
++    // Guards against a vacuous pass: if the scene produced no distortion at
++    // all, every gradient would be 0 and the finite-diff test would agree
++    // trivially. At least one depth gradient must have real magnitude.
++    let device =
++        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
++    let cam = std_cam();
++    let img_size = glam::uvec2(32, 32);
++    let scene = base_scene();
++    let (splats, grads) = analytical_grads(&scene, &cam, img_size, &device).await;
++
++    let mut max_abs = 0.0f32;
++    for splat in 0..4 {
++        let g = analytical_at(&splats, &grads, Lane::Mean, splat, 2).await;
++        max_abs = max_abs.max(g.abs());
++    }
++    assert!(
++        max_abs > 1e-5,
++        "all depth gradients ~0 ({max_abs:e}) — scene is degenerate, test would be vacuous"
++    );
++}
++
++#[tokio::test]
++async fn distortion_does_not_touch_color() {
++    // L_d depends only on weights and depths, never on colour, so the SH
++    // gradient from the distortion channel must be exactly zero. A nonzero
++    // value means gradient is leaking between channels.
++    let device =
++        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
++    let cam = std_cam();
++    let img_size = glam::uvec2(32, 32);
++    let scene = base_scene();
++    let (splats, grads) = analytical_grads(&scene, &cam, img_size, &device).await;
++
++    for splat in 0..4 {
++        for comp in 0..3 {
++            let g = analytical_at(&splats, &grads, Lane::ShDc, splat, comp).await;
++            assert!(
++                g.abs() < 1e-9,
++                "sh_dc[{splat}][{comp}] gradient {g:e} should be exactly 0"
++            );
++        }
++    }
++}
