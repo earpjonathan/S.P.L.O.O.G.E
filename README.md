@@ -5,7 +5,7 @@ flights as one 3D Gaussian Splatting reconstruction, all on an Apple Silicon Mac
 with no CUDA. There's also a WebGL viewer that flies the recorded flight paths
 back through the reconstruction next to the original footage.
 
-**Write-up with figures and a live viewer:** https://projects.jonathanearp.xyz/splat/
+Write-up, with figures and a live viewer: https://projects.jonathanearp.xyz/splat/
 
 ## Results
 
@@ -42,8 +42,9 @@ DJI O4 Pro video (2688x2016, 50 fps)
 
 Frames get picked when the camera has turned 8 degrees since the last kept frame,
 with a minimum gap of 2 frames and a maximum of 15. That keeps 7,471 frames out of
-about 70,000. Flying straight barely changes the view and a fast yaw changes
-everything, so sampling on a timer wastes frames on the straights and misses the turns.
+about 70,000. Flying straight barely changes the view, while a fast yaw changes
+all of it, so sampling on a timer wastes frames on the straights and misses the
+turns.
 
 ## What's in here
 
@@ -62,9 +63,9 @@ camera JSON aren't in the repo. They add up to about 65 GB.
 
 ## Running it
 
-This was built as a working folder, not a package. The scripts assume the project
-sits at `~/Desktop/fpv-splat` and that the data folders (`clips/`, `gyro/`,
-`frames/`, `colmap/`) are next to them.
+It's set up as my working folder, so the scripts assume the project sits at
+`~/Desktop/fpv-splat` and that the data folders (`clips/`, `gyro/`, `frames/`,
+`colmap/`) are next to them.
 
 Tools used: macOS on Apple Silicon, COLMAP 4.1.1 (CPU), ffmpeg, Gyroflow 1.6.3,
 Python 3.14 with `requirements.txt`, and Brush built from source.
